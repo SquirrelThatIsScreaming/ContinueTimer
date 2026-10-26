@@ -22,7 +22,15 @@ struct SessionInfo: Identifiable, Hashable {
     let cwd: String
     let title: String
     let modified: Date
+    let path: URL
+    /// Tokens the last model call read; roughly what a resume re-reads uncached once the cache has expired.
+    let contextTokens: Int?
 }
+
+/// Above this, resuming after a long limit wait is expensive enough to suggest a fresh session.
+let largeContext = 100_000
+
+func tokenLabel(_ n: Int) -> String { n >= 1000 ? "\(Int((Double(n) / 1000).rounded()))k" : "\(n)" }
 
 enum SessionStore {
     static let home = FileManager.default.homeDirectoryForCurrentUser
@@ -35,7 +43,7 @@ enum SessionStore {
         (try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
     }
 
-    private static func json(_ line: Substring) -> [String: Any]? {
+    static func json(_ line: Substring) -> [String: Any]? {
         guard let d = line.data(using: .utf8) else { return nil }
         return (try? JSONSerialization.jsonObject(with: d)) as? [String: Any]
     }
@@ -52,7 +60,7 @@ enum SessionStore {
         return String(decoding: data, as: UTF8.self).split(separator: "\n").prefix(lines).map { $0 }
     }
 
-    private static func tail(_ u: URL, bytes: Int = 2 << 20) -> [Substring] {
+    static func tail(_ u: URL, bytes: Int = 2 << 20) -> [Substring] {
         guard let fh = try? FileHandle(forReadingFrom: u) else { return [] }
         defer { try? fh.close() }
         let size = (try? fh.seekToEnd()) ?? 0
@@ -80,8 +88,29 @@ enum SessionStore {
                   let p = o["payload"] as? [String: Any], let id = p["id"] as? String,
                   p["parent_thread_id"] == nil else { return nil }
             let cwd = p["cwd"] as? String ?? home.path
-            return SessionInfo(id: id, cwd: cwd, title: titles[id] ?? (cwd as NSString).lastPathComponent, modified: mtime(u))
+            return SessionInfo(id: id, cwd: cwd, title: titles[id] ?? (cwd as NSString).lastPathComponent,
+                               modified: mtime(u), path: u, contextTokens: codexContext(u))
         }.prefix(limit).map { $0 }
+    }
+
+    private static func codexContext(_ u: URL) -> Int? {
+        // token_count events are frequent, so a small tail usually suffices.
+        for bytes in [128 << 10, 2 << 20] {
+            for line in tail(u, bytes: bytes).reversed() where line.contains("\"last_token_usage\"") {
+                if let p = json(line)?["payload"] as? [String: Any], let info = p["info"] as? [String: Any],
+                   let last = info["last_token_usage"] as? [String: Any], let n = last["input_tokens"] as? Int { return n }
+            }
+        }
+        return nil
+    }
+
+    private static func claudeContext(_ lines: [Substring]) -> Int? {
+        for line in lines.reversed() where line.contains("\"cache_read_input_tokens\"") {
+            guard let o = json(line), o["type"] as? String == "assistant", o["isSidechain"] as? Bool != true,
+                  let u = (o["message"] as? [String: Any])?["usage"] as? [String: Any] else { continue }
+            return ["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"].reduce(0) { $0 + (u[$1] as? Int ?? 0) }
+        }
+        return nil
     }
 
     // ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
@@ -95,22 +124,155 @@ enum SessionStore {
         }
         return files.sorted { mtime($0) > mtime($1) }.prefix(limit).compactMap { u in
             let id = u.deletingPathExtension().lastPathComponent
-            guard let cwd = head(u, lines: 30).lazy.compactMap({ json($0)?["cwd"] as? String }).first else { return nil }
+            let lines = tail(u)
+            // A session can change folders. Prefer the latest cwd that maps to the transcript's
+            // project dir (where `claude --resume` looks for it), else the latest, else the first.
+            let cwds = lines.reversed().compactMap { json($0)?["cwd"] as? String }
+                + head(u, lines: 30).compactMap { json($0)?["cwd"] as? String }
+            let project = u.deletingLastPathComponent().lastPathComponent
+            let encode = { (p: String) in String(p.map { $0.isLetter || $0.isNumber ? $0 : "-" }) }
+            guard let cwd = cwds.first(where: { encode($0) == project }) ?? cwds.first else { return nil }
             var custom: String?, ai: String?
-            for line in tail(u).reversed() where line.contains("-title\"") {
+            for line in lines.reversed() where line.contains("-title\"") {
                 guard let o = json(line) else { continue }
                 if custom == nil, let t = o["customTitle"] as? String { custom = t; break }
                 if ai == nil, let t = o["aiTitle"] as? String { ai = t }
             }
-            return SessionInfo(id: id, cwd: cwd, title: custom ?? ai ?? (cwd as NSString).lastPathComponent, modified: mtime(u))
+            return SessionInfo(id: id, cwd: cwd, title: custom ?? ai ?? (cwd as NSString).lastPathComponent,
+                               modified: mtime(u), path: u, contextTokens: claudeContext(lines))
         }
     }
 }
 
 // MARK: - Jobs
 
+// MARK: - Handoff
+// A fresh session avoids re-reading a large expired cache. It starts from a summary built
+// deterministically from the old transcript, so building it costs no tokens.
+
+enum Handoff {
+    private struct Parts {
+        var requests: [String] = []
+        var lastAssistant: String?
+        var plan: [(status: String, text: String)] = []
+    }
+
+    private static func clip(_ s: String, _ n: Int) -> String {
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.count > n ? String(t.prefix(n)) + " […]" : t
+    }
+
+    /// Typed by a person, as opposed to injected context (AGENTS.md, <system-…> tags, tool results).
+    private static func isTyped(_ s: String) -> Bool {
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !t.isEmpty && !t.hasPrefix("<") && !t.hasPrefix("# AGENTS.md")
+    }
+
+    private static func planItems(_ list: [[String: Any]]?) -> [(status: String, text: String)] {
+        (list ?? []).compactMap { i in
+            guard let text = (i["content"] ?? i["step"]) as? String else { return nil }
+            return (i["status"] as? String ?? "pending", text)
+        }
+    }
+
+    /// The desktop app's update_plan sends the full list once, then progress-only calls
+    /// ({advance}, {done: [1-based], start: n}) that must be replayed onto it.
+    private static func applyPlanUpdate(_ plan: inout [(status: String, text: String)], _ input: [String: Any]) {
+        if let items = input["items"] as? [[String: Any]] { plan = planItems(items); return }
+        if input["advance"] as? Bool == true {
+            if let i = plan.firstIndex(where: { $0.status == "in_progress" }) { plan[i].status = "completed" }
+            if let i = plan.firstIndex(where: { $0.status == "pending" }) { plan[i].status = "in_progress" }
+        }
+        for n in input["done"] as? [Int] ?? [] where plan.indices.contains(n - 1) { plan[n - 1].status = "completed" }
+        if let n = input["start"] as? Int, plan.indices.contains(n - 1) {
+            for i in plan.indices where plan[i].status == "in_progress" { plan[i].status = "pending" }
+            plan[n - 1].status = "in_progress"
+        }
+    }
+
+    private static func claudeParts(_ lines: [Substring]) -> Parts {
+        var p = Parts()
+        for line in lines {
+            guard let o = SessionStore.json(line), o["isSidechain"] as? Bool != true,
+                  let m = o["message"] as? [String: Any] else { continue }
+            let blocks: [[String: Any]] = (m["content"] as? String).map { [["type": "text", "text": $0]] }
+                ?? m["content"] as? [[String: Any]] ?? []
+            switch o["type"] as? String {
+            case "user" where o["isMeta"] as? Bool != true:
+                let typed = blocks.filter { $0["type"] as? String == "text" }.compactMap { $0["text"] as? String }.filter(isTyped)
+                if !typed.isEmpty { p.requests.append(typed.joined(separator: "\n")) }
+            case "assistant":
+                for b in blocks {
+                    if b["type"] as? String == "text", let t = b["text"] as? String, !t.isEmpty { p.lastAssistant = t }
+                    if b["type"] as? String == "tool_use", let input = b["input"] as? [String: Any] {
+                        let name = b["name"] as? String ?? ""
+                        if name == "TodoWrite" { p.plan = planItems(input["todos"] as? [[String: Any]]) }
+                        if name.hasSuffix("update_plan") { applyPlanUpdate(&p.plan, input) }
+                    }
+                }
+            default: break
+            }
+        }
+        return p
+    }
+
+    private static func codexParts(_ lines: [Substring]) -> Parts {
+        var p = Parts()
+        for line in lines {
+            guard let o = SessionStore.json(line), o["type"] as? String == "response_item",
+                  let pl = o["payload"] as? [String: Any] else { continue }
+            if pl["type"] as? String == "message" {
+                let texts = (pl["content"] as? [[String: Any]] ?? []).compactMap { $0["text"] as? String }
+                switch pl["role"] as? String {
+                case "user": p.requests += texts.filter(isTyped)
+                case "assistant": if let t = texts.last(where: { !$0.isEmpty }) { p.lastAssistant = t }
+                default: break
+                }
+            }
+            if pl["name"] as? String == "update_plan", let args = pl["arguments"] as? String,
+               let a = SessionStore.json(Substring(args)) {
+                p.plan = planItems(a["plan"] as? [[String: Any]])
+            }
+        }
+        return p
+    }
+
+    static func build(harness: Harness, sessionId: String, cwd: String, transcript: URL,
+                      contextTokens: Int?, message: String) -> String {
+        let text = (try? String(contentsOf: transcript, encoding: .utf8)) ?? ""
+        let lines = text.split(separator: "\n")
+        let p = harness == .claude ? claudeParts(lines) : codexParts(lines)
+        let size = contextTokens.map { " (~\(tokenLabel($0)) tokens)" } ?? ""
+        var out = """
+        You are continuing work from an earlier \(harness.rawValue) session that stopped when the usage limit was reached. \
+        Its full context\(size) is deliberately not loaded; below is a handoff extracted from its transcript.
+
+        Working directory: \(cwd)
+        Previous session: \(sessionId)
+        Full transcript (JSONL, large): \(transcript.path). Search it for specifics only if you need them.
+
+        """
+        if let first = p.requests.first { out += "\n## Original request\n\(clip(first, 2500))\n" }
+        let recent = p.requests.dropFirst().suffix(3)
+        if !recent.isEmpty {
+            out += "\n## Most recent user messages (oldest first)\n" + recent.map { "- " + clip($0, 1200) }.joined(separator: "\n") + "\n"
+        }
+        if !p.plan.isEmpty {
+            out += "\n## Last plan\n" + p.plan.map { "- [\($0.status)] \($0.text)" }.joined(separator: "\n") + "\n"
+        }
+        if let a = p.lastAssistant { out += "\n## Last assistant message before the stop\n\(clip(a, 3000))\n" }
+        out += """
+
+        ## Next step
+        First re-establish the current state (git status / git diff, files named above); don't redo finished work. Then: \(message)
+        """
+        return out
+    }
+}
+
 struct Job: Codable, Identifiable {
     enum Status: String, Codable { case scheduled, running, done, failed }
+    enum Mode: String, Codable { case resume, fresh }
     var id = UUID()
     var harness: Harness
     var sessionId: String
@@ -123,23 +285,29 @@ struct Job: Codable, Identifiable {
     var exitCode: Int32?
     var logPath: String?
     var note: String?
+    var mode: Mode?             // nil (jobs saved before modes existed) means resume
+    var transcript: String?
+    var contextTokens: Int?
+    var isFresh: Bool { mode == .fresh }
 }
 
 func shellQuote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
 
-func command(for j: Job) -> String {
+/// `prompt` is the handoff for fresh sessions; resumes send `j.message`.
+func command(for j: Job, prompt: String? = nil) -> String {
     var args: [String]
     switch j.harness {
     case .codex:
-        args = ["codex", "exec", "resume", "--skip-git-repo-check"]
+        args = ["codex", "exec"] + (j.isFresh ? [] : ["resume"]) + ["--skip-git-repo-check"]
         switch j.permission {
         case "full": args.append("--dangerously-bypass-approvals-and-sandbox")
         case "read-only": args += ["-c", "sandbox_mode=\"read-only\""]
         default: args += ["-c", "sandbox_mode=\"workspace-write\""]
         }
-        args += [j.sessionId, j.message]
+        args += j.isFresh ? [prompt ?? j.message] : [j.sessionId, j.message]
     case .claude:
-        args = ["claude", "--resume", j.sessionId, "--permission-mode", j.permission, "-p", j.message]
+        args = ["claude"] + (j.isFresh ? [] : ["--resume", j.sessionId])
+            + ["--permission-mode", j.permission, "-p", prompt ?? j.message]
     }
     return "cd \(shellQuote(j.cwd)) && exec " + args.map(shellQuote).joined(separator: " ")
 }
@@ -310,11 +478,25 @@ final class Model: ObservableObject {
 
     func run(_ id: UUID) {
         guard let i = jobs.firstIndex(where: { $0.id == id }) else { return }
-        if jobs[i].harness == .codex, let app = CodexApp.lockHolder(of: jobs[i].sessionId) {
+        // A fresh session has no lock to conflict with, so only resumes need the app route.
+        if jobs[i].harness == .codex, !jobs[i].isFresh, let app = CodexApp.lockHolder(of: jobs[i].sessionId) {
             return typeIntoApp(id, app)
         }
-        let cmd = command(for: jobs[i])
+        var prompt: String?
+        if jobs[i].isFresh {
+            let j = jobs[i]
+            let transcript = j.transcript.map(URL.init(fileURLWithPath:))
+                ?? (j.harness == .codex ? CodexApp.rollout(of: j.sessionId) : nil)
+            guard let t = transcript else {
+                jobs[i].status = .failed
+                return finish(id, ok: false, note: "transcript for the handoff not found")
+            }
+            prompt = Handoff.build(harness: j.harness, sessionId: j.sessionId, cwd: j.cwd, transcript: t,
+                                   contextTokens: j.contextTokens, message: j.message)
+        }
+        let cmd = command(for: jobs[i], prompt: prompt)
         guard let (log, fh) = openLog(jobs[i]) else { return }
+        if let prompt { fh.write(Data("Fresh session with this handoff:\n\n\(prompt)\n\n---\n".utf8)) }
         fh.write(Data("$ \(cmd)\n\n".utf8))
 
         let p = Process()
@@ -417,6 +599,7 @@ struct ContentView: View {
     @State private var minutes = 0
     @State private var message = "continue"
     @State private var permission = "workspace-write"
+    @State private var mode: Job.Mode = .resume
 
     private var fireDate: Date { model.now.addingTimeInterval(TimeInterval(hours * 3600 + minutes * 60)) }
     private var selected: SessionInfo? { sessions.first { $0.id == sessionId } }
@@ -432,13 +615,28 @@ struct ContentView: View {
             HStack {
                 Picker("Session", selection: $sessionId) {
                     ForEach(sessions) { s in
-                        Text("\(s.title) · \(s.modified.formatted(.relative(presentation: .named)))").tag(s.id)
+                        Text("\(s.title) · \(s.modified.formatted(.relative(presentation: .named)))"
+                             + (s.contextTokens.map { " · \(tokenLabel($0))" } ?? "")).tag(s.id)
                     }
                 }
                 Button { reload() } label: { Image(systemName: "arrow.clockwise") }.help("Reload sessions")
             }
             if let s = selected {
                 Text(s.cwd).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                Picker("", selection: $mode) {
+                    Text("Resume").tag(Job.Mode.resume)
+                    Text("Fresh + handoff").tag(Job.Mode.fresh)
+                }
+                .pickerStyle(.segmented).labelsHidden()
+                HStack(alignment: .firstTextBaseline) {
+                    Text(modeHint(s)).font(.caption)
+                        .foregroundStyle(mode == .resume && (s.contextTokens ?? 0) > largeContext ? .orange : .secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if mode == .fresh {
+                        Spacer()
+                        Button("Preview") { preview(s) }.font(.caption).buttonStyle(.link)
+                    }
+                }
             }
 
             HStack {
@@ -484,6 +682,31 @@ struct ContentView: View {
             permission = h.permissions[0].value
             reload()
         }
+        .onChange(of: sessionId) { _, _ in
+            // Large chats default to a fresh session; you can still switch back to Resume.
+            mode = (selected?.contextTokens ?? 0) > largeContext ? .fresh : .resume
+        }
+    }
+
+    private func modeHint(_ s: SessionInfo) -> String {
+        let size = s.contextTokens.map { "~\(tokenLabel($0)) tokens" } ?? "an unknown amount"
+        switch mode {
+        case .resume:
+            return (s.contextTokens ?? 0) > largeContext
+                ? "Resuming re-reads \(size) uncached once the cache has expired, which uses up a lot of the fresh limit."
+                : "Resumes this chat with its full context (\(size))."
+        case .fresh:
+            return "Starts a new session with a summary built from this chat instead of re-reading \(size)."
+        }
+    }
+
+    private func preview(_ s: SessionInfo) {
+        let text = Handoff.build(harness: harness, sessionId: s.id, cwd: s.cwd, transcript: s.path,
+                                 contextTokens: s.contextTokens, message: message)
+        try? FileManager.default.createDirectory(at: Model.logDir, withIntermediateDirectories: true)
+        let u = Model.logDir.appendingPathComponent("handoff-preview.md")
+        try? text.write(to: u, atomically: true, encoding: .utf8)
+        NSWorkspace.shared.open(u)
     }
 
     private func reload() {
@@ -494,9 +717,10 @@ struct ContentView: View {
     private func schedule() {
         guard let s = selected else { return }
         // Ask now, while you're here: typing into the Codex app later needs Accessibility.
-        if harness == .codex { CodexApp.accessibilityGranted(prompt: true) }
+        if harness == .codex && mode == .resume { CodexApp.accessibilityGranted(prompt: true) }
         model.schedule(Job(harness: harness, sessionId: s.id, cwd: s.cwd, title: s.title,
-                           message: message, permission: permission, fireDate: fireDate))
+                           message: message, permission: permission, fireDate: fireDate,
+                           mode: mode, transcript: s.path.path, contextTokens: s.contextTokens))
     }
 }
 
@@ -528,11 +752,12 @@ struct JobRow: View {
 
     private var status: String {
         let t = job.fireDate.formatted(date: .omitted, time: .shortened)
+        let h = job.harness.rawValue + (job.isFresh ? " · fresh" : "")
         switch job.status {
-        case .scheduled: return "\(job.harness.rawValue) · at \(t) · in \(countdown(job.fireDate.timeIntervalSince(model.now)))"
-        case .running: return "\(job.harness.rawValue) · running…"
-        case .done: return "\(job.harness.rawValue) · done at \(t)" + (job.note.map { " · \($0)" } ?? "")
-        case .failed: return "\(job.harness.rawValue) · failed" + (job.exitCode.map { " (exit \($0))" } ?? "")
+        case .scheduled: return "\(h) · at \(t) · in \(countdown(job.fireDate.timeIntervalSince(model.now)))"
+        case .running: return "\(h) · running…"
+        case .done: return "\(h) · done at \(t)" + (job.note.map { " · \($0)" } ?? "")
+        case .failed: return "\(h) · failed" + (job.exitCode.map { " (exit \($0))" } ?? "")
             + (job.note.map { " · \($0)" } ?? "")
         }
     }
