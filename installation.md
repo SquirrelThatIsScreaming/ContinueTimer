@@ -19,7 +19,7 @@ zsh -lc 'command -v codex; command -v claude'
 If you are not already in a clone of this repository:
 
 ```bash
-git clone https://github.com/lassehalle/ContinueTimer.git ~/ContinueTimer
+git clone https://github.com/SquirrelThatIsScreaming/ContinueTimer.git ~/ContinueTimer
 cd ~/ContinueTimer
 ```
 
