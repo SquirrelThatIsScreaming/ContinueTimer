@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 app=ContinueTimer.app
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS"
-swiftc -O -swift-version 5 -parse-as-library -target arm64-apple-macos14.0 \
+swiftc -O -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos14.0" \
   ContinueTimer.swift -o "$app/Contents/MacOS/ContinueTimer"
 cat > "$app/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
