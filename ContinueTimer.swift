@@ -49,7 +49,7 @@ enum SessionStore {
     }
 
     /// Reads from the start of a file until `lines` complete lines (or `maxBytes`) are available.
-    private static func head(_ u: URL, lines: Int, maxBytes: Int = 8 << 20) -> [Substring] {
+    static func head(_ u: URL, lines: Int, maxBytes: Int = 8 << 20) -> [Substring] {
         guard let fh = try? FileHandle(forReadingFrom: u) else { return [] }
         defer { try? fh.close() }
         var data = Data()
@@ -237,11 +237,142 @@ enum Handoff {
         return p
     }
 
+    // MARK: Subagents
+    // A new session can't see or message the old session's subagents, so their state goes into the handoff.
+
+    struct Subagent {
+        var name: String
+        var task: String?
+        var status: String
+        var report: String?
+        var modified: Date
+        var transcript: URL
+    }
+
+    private static func mtime(_ u: URL) -> Date {
+        (try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+    }
+
+    /// Codex: every subagent has its own rollout whose session_meta names its parent thread.
+    static func codexSubagents(of rootId: String, rollout: URL) -> [Subagent] {
+        // Rollout names start with their creation time, so only later files can be children.
+        let stamp = rollout.lastPathComponent.dropFirst("rollout-".count).prefix(19)
+        let root = SessionStore.home.appendingPathComponent(".codex/sessions")
+        var meta: [(url: URL, id: String, parent: String, name: String)] = []
+        if let e = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey]) {
+            for case let u as URL in e where u.pathExtension == "jsonl" && u != rollout {
+                let n = u.lastPathComponent
+                guard n.hasPrefix("rollout-"), n.dropFirst("rollout-".count).prefix(19) >= stamp,
+                      let first = SessionStore.head(u, lines: 1).first,
+                      let p = SessionStore.json(first)?["payload"] as? [String: Any],
+                      let id = p["id"] as? String, let parent = p["parent_thread_id"] as? String else { continue }
+                let path = p["agent_path"] as? String ?? id
+                let name = (p["agent_nickname"] as? String).map { "\(path) (\($0))" } ?? path
+                meta.append((u, id, parent, name))
+            }
+        }
+        // Include nested subagents (children of children).
+        var ids: Set<String> = [rootId], picked: [(url: URL, name: String)] = [], grew = true
+        while grew {
+            grew = false
+            for m in meta where ids.contains(m.parent) && !ids.contains(m.id) {
+                ids.insert(m.id); picked.append((m.url, m.name)); grew = true
+            }
+        }
+        return picked.map { m in
+            var report: String?, finished = false
+            for line in SessionStore.tail(m.url, bytes: 512 << 10).reversed() where line.contains("\"task_complete\"") {
+                if let p = SessionStore.json(line)?["payload"] as? [String: Any], p["type"] as? String == "task_complete" {
+                    finished = true
+                    report = p["last_agent_message"] as? String
+                    break
+                }
+            }
+            // The task Codex sends a subagent is encrypted, so only its name is known.
+            return Subagent(name: m.name, task: nil,
+                            status: finished ? "finished" : "no final result recorded (still running, or cut off by the limit)",
+                            report: report, modified: mtime(m.url), transcript: m.url)
+        }
+    }
+
+    /// The string fields of a parent-transcript record that can carry a subagent hand-back.
+    private static func frames(_ o: [String: Any]) -> [String] {
+        var out: [String] = []
+        if let s = o["content"] as? String { out.append(s) }
+        if let s = (o["attachment"] as? [String: Any])?["prompt"] as? String { out.append(s) }
+        if let m = o["message"] as? [String: Any] {
+            if let s = m["content"] as? String { out.append(s) }
+            out += (m["content"] as? [[String: Any]] ?? []).compactMap { $0["text"] as? String }
+        }
+        return out
+    }
+
+    private static func between(_ s: String, _ a: String, _ b: String) -> String? {
+        guard let r1 = s.range(of: a), let r2 = s.range(of: b, range: r1.upperBound..<s.endIndex) else { return nil }
+        return String(s[r1.upperBound..<r2.lowerBound])
+    }
+
+    /// Claude: <session>/subagents/agent-<agentId>.jsonl plus .meta.json. The final report isn't in that
+    /// transcript; the parent receives it as <agent-message from="<agentId>">, every report line indented.
+    static func claudeSubagents(transcript: URL, parentLines: [Substring]) -> [Subagent] {
+        let dir = transcript.deletingPathExtension().appendingPathComponent("subagents")
+        let files = ((try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
+            .filter { $0.pathExtension == "jsonl" }
+        guard !files.isEmpty else { return [] }
+
+        var reports: [String: String] = [:], states: [String: String] = [:]
+        for line in parentLines where line.contains("agent-message from=") || line.contains("<task-notification>") {
+            guard let o = SessionStore.json(line) else { continue }
+            for s in frames(o) {
+                if let id = between(s, "<agent-message from=\"", "\""), let body = between(s, "The report follows:\n", "</agent-message>") {
+                    reports[id] = body.split(separator: "\n", omittingEmptySubsequences: false)
+                        .map { $0.hasPrefix("  ") ? String($0.dropFirst(2)) : String($0) }.joined(separator: "\n")
+                }
+                if let id = between(s, "<task-id>", "</task-id>"), let st = between(s, "<status>", "</status>") { states[id] = st }
+            }
+        }
+
+        return files.map { u in
+            let agentId = String(u.deletingPathExtension().lastPathComponent.dropFirst("agent-".count))
+            let metaURL = u.deletingPathExtension().appendingPathExtension("meta.json")
+            let meta = (try? Data(contentsOf: metaURL)).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            let task = SessionStore.head(u, lines: 3).lazy.compactMap { SessionStore.json($0) }
+                .first { $0["type"] as? String == "user" }
+                .flatMap { ($0["message"] as? [String: Any])?["content"] as? String }
+            let report = reports[agentId]
+            let state = report != nil ? "finished" : states[agentId].map { $0 == "completed" ? "finished" : $0 }
+            let desc = meta?["description"] as? String
+            let type = meta?["agentType"] as? String
+            let name = [desc, type.map { "(\($0))" }].compactMap { $0 }.joined(separator: " ")
+            return Subagent(name: name.isEmpty ? "agent \(agentId)" : name, task: task,
+                            status: state ?? "no final result recorded (still running, or cut off by the limit)",
+                            report: report, modified: mtime(u), transcript: u)
+        }
+    }
+
+    private static func subagentSection(_ agents: [Subagent]) -> String {
+        guard !agents.isEmpty else { return "" }
+        let shown = agents.sorted { $0.modified > $1.modified }.prefix(15).sorted { $0.modified < $1.modified }
+        var out = "\n## Subagents of the previous session\n"
+        out += "They were started by the previous session and can't be messaged or listed from this one. "
+        out += "Use their results instead of redoing their work; read a transcript only if you need more detail.\n"
+        if agents.count > shown.count { out += "(\(agents.count) in total; the \(shown.count) most recently active are listed.)\n" }
+        for a in shown {
+            let when = a.modified.formatted(date: .omitted, time: .shortened)
+            out += "\n### \(a.name)\nStatus: \(a.status); last active \(when)\nTranscript: \(a.transcript.path)\n"
+            if let t = a.task { out += "Task: \(clip(t, 400))\n" }
+            if let r = a.report { out += "Last report: \(clip(r, 700))\n" }
+        }
+        return out
+    }
+
     static func build(harness: Harness, sessionId: String, cwd: String, transcript: URL,
                       contextTokens: Int?, message: String) -> String {
         let text = (try? String(contentsOf: transcript, encoding: .utf8)) ?? ""
         let lines = text.split(separator: "\n")
         let p = harness == .claude ? claudeParts(lines) : codexParts(lines)
+        let agents = harness == .claude ? claudeSubagents(transcript: transcript, parentLines: lines)
+                                        : codexSubagents(of: sessionId, rollout: transcript)
         let size = contextTokens.map { " (~\(tokenLabel($0)) tokens)" } ?? ""
         var out = """
         You are continuing work from an earlier \(harness.rawValue) session that stopped when the usage limit was reached. \
@@ -261,6 +392,7 @@ enum Handoff {
             out += "\n## Last plan\n" + p.plan.map { "- [\($0.status)] \($0.text)" }.joined(separator: "\n") + "\n"
         }
         if let a = p.lastAssistant { out += "\n## Last assistant message before the stop\n\(clip(a, 3000))\n" }
+        out += subagentSection(agents)
         out += """
 
         ## Next step
@@ -272,7 +404,7 @@ enum Handoff {
 
 struct Job: Codable, Identifiable {
     enum Status: String, Codable { case scheduled, running, done, failed }
-    enum Mode: String, Codable { case resume, fresh }
+    enum Mode: String, Codable { case resume, fresh, new }
     var id = UUID()
     var harness: Harness
     var sessionId: String
@@ -289,6 +421,8 @@ struct Job: Codable, Identifiable {
     var transcript: String?
     var contextTokens: Int?
     var isFresh: Bool { mode == .fresh }
+    /// Fresh handoffs and new tasks both start a new session instead of resuming one.
+    var startsSession: Bool { mode == .fresh || mode == .new }
 }
 
 func shellQuote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
@@ -298,15 +432,15 @@ func command(for j: Job, prompt: String? = nil) -> String {
     var args: [String]
     switch j.harness {
     case .codex:
-        args = ["codex", "exec"] + (j.isFresh ? [] : ["resume"]) + ["--skip-git-repo-check"]
+        args = ["codex", "exec"] + (j.startsSession ? [] : ["resume"]) + ["--skip-git-repo-check"]
         switch j.permission {
         case "full": args.append("--dangerously-bypass-approvals-and-sandbox")
         case "read-only": args += ["-c", "sandbox_mode=\"read-only\""]
         default: args += ["-c", "sandbox_mode=\"workspace-write\""]
         }
-        args += j.isFresh ? [prompt ?? j.message] : [j.sessionId, j.message]
+        args += j.startsSession ? [prompt ?? j.message] : [j.sessionId, j.message]
     case .claude:
-        args = ["claude"] + (j.isFresh ? [] : ["--resume", j.sessionId])
+        args = ["claude"] + (j.startsSession ? [] : ["--resume", j.sessionId])
             + ["--permission-mode", j.permission, "-p", prompt ?? j.message]
     }
     return "cd \(shellQuote(j.cwd)) && exec " + args.map(shellQuote).joined(separator: " ")
@@ -479,7 +613,7 @@ final class Model: ObservableObject {
     func run(_ id: UUID) {
         guard let i = jobs.firstIndex(where: { $0.id == id }) else { return }
         // A fresh session has no lock to conflict with, so only resumes need the app route.
-        if jobs[i].harness == .codex, !jobs[i].isFresh, let app = CodexApp.lockHolder(of: jobs[i].sessionId) {
+        if jobs[i].harness == .codex, !jobs[i].startsSession, let app = CodexApp.lockHolder(of: jobs[i].sessionId) {
             return typeIntoApp(id, app)
         }
         var prompt: String?
@@ -600,6 +734,9 @@ struct ContentView: View {
     @State private var message = "continue"
     @State private var permission = "workspace-write"
     @State private var mode: Job.Mode = .resume
+    @State private var newTask = false
+    @State private var folder = ""
+    @State private var prompt = ""
 
     private var fireDate: Date { model.now.addingTimeInterval(TimeInterval(hours * 3600 + minutes * 60)) }
     private var selected: SessionInfo? { sessions.first { $0.id == sessionId } }
@@ -611,7 +748,25 @@ struct ContentView: View {
                 ForEach(Harness.allCases) { Text($0.rawValue).tag($0) }
             }
             .pickerStyle(.segmented).labelsHidden()
+            Picker("", selection: $newTask) {
+                Text("Continue a chat").tag(false)
+                Text("New task").tag(true)
+            }
+            .pickerStyle(.segmented).labelsHidden()
 
+            if newTask {
+                HStack {
+                    Picker("Folder", selection: $folder) {
+                        ForEach(recentFolders, id: \.self) { Text(($0 as NSString).abbreviatingWithTildeInPath).tag($0) }
+                        if !recentFolders.contains(folder) { Text(folder).tag(folder) }
+                    }
+                    Button { chooseFolder() } label: { Image(systemName: "folder") }.help("Choose another folder")
+                }
+                Text("Prompt for the new session").font(.caption).foregroundStyle(.secondary)
+                TextEditor(text: $prompt)
+                    .font(.body).frame(height: 90)
+                    .overlay(RoundedRectangle(cornerRadius: 4).stroke(.quaternary))
+            } else {
             HStack {
                 Picker("Session", selection: $sessionId) {
                     ForEach(sessions) { s in
@@ -638,6 +793,7 @@ struct ContentView: View {
                     }
                 }
             }
+            }
 
             HStack {
                 Text("Resets in")
@@ -649,9 +805,11 @@ struct ContentView: View {
             Text("Sends at \(fireDate.formatted(date: .omitted, time: .shortened))")
                 .font(.caption).foregroundStyle(.secondary)
 
-            HStack {
-                Text("Message")
-                TextField("continue", text: $message)
+            if !newTask {
+                HStack {
+                    Text("Message")
+                    TextField("continue", text: $message)
+                }
             }
             Picker("Permissions", selection: $permission) {
                 ForEach(harness.permissions, id: \.value) { Text($0.label).tag($0.value) }
@@ -659,7 +817,8 @@ struct ContentView: View {
 
             Button("Schedule") { schedule() }
                 .keyboardShortcut(.defaultAction)
-                .disabled(selected == nil || message.isEmpty)
+                .disabled(newTask ? prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !isDirectory(folder)
+                                  : selected == nil || message.isEmpty)
                 .frame(maxWidth: .infinity, alignment: .trailing)
 
             if !model.jobs.isEmpty {
@@ -697,6 +856,8 @@ struct ContentView: View {
                 : "Resumes this chat with its full context (\(size))."
         case .fresh:
             return "Starts a new session with a summary built from this chat instead of re-reading \(size)."
+        case .new:
+            return ""
         }
     }
 
@@ -712,9 +873,39 @@ struct ContentView: View {
     private func reload() {
         sessions = SessionStore.recent(harness)
         if !sessions.contains(where: { $0.id == sessionId }) { sessionId = sessions.first?.id ?? "" }
+        if folder.isEmpty { folder = recentFolders.first ?? FileManager.default.homeDirectoryForCurrentUser.path }
+    }
+
+    /// Folders of recent chats (this harness), newest first, as candidates for a new task.
+    private var recentFolders: [String] {
+        var seen = Set<String>()
+        return sessions.map(\.cwd).filter { isDirectory($0) && seen.insert($0).inserted }
+    }
+
+    private func isDirectory(_ p: String) -> Bool {
+        var dir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: p, isDirectory: &dir) && dir.boolValue
+    }
+
+    private func chooseFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.directoryURL = URL(fileURLWithPath: folder)
+        NSApp.activate(ignoringOtherApps: true)
+        if panel.runModal() == .OK, let u = panel.url { folder = u.path }
     }
 
     private func schedule() {
+        if newTask {
+            let p = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+            let firstLine = p.split(separator: "\n").first.map(String.init) ?? p
+            model.schedule(Job(harness: harness, sessionId: "", cwd: folder,
+                               title: firstLine.count > 60 ? String(firstLine.prefix(60)) + "…" : firstLine,
+                               message: p, permission: permission, fireDate: fireDate, mode: .new))
+            prompt = ""
+            return
+        }
         guard let s = selected else { return }
         // Ask now, while you're here: typing into the Codex app later needs Accessibility.
         if harness == .codex && mode == .resume { CodexApp.accessibilityGranted(prompt: true) }
@@ -752,7 +943,7 @@ struct JobRow: View {
 
     private var status: String {
         let t = job.fireDate.formatted(date: .omitted, time: .shortened)
-        let h = job.harness.rawValue + (job.isFresh ? " · fresh" : "")
+        let h = job.harness.rawValue + (job.mode == .fresh ? " · fresh" : job.mode == .new ? " · new task" : "")
         switch job.status {
         case .scheduled: return "\(h) · at \(t) · in \(countdown(job.fireDate.timeIntervalSince(model.now)))"
         case .running: return "\(h) · running…"
